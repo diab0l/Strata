@@ -19,8 +19,9 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, Service, StrataEngine,  # noqa: E402
+from serve.frontend import ChatTemplate, THINK_END  # noqa: E402
+from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, IM_END, MockEngine, Service,  # noqa: E402
+                          StrataEngine,
                           engine_args, layer_split_value, prompt_tokens_seen, request_timings, serve,
                           start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
@@ -2679,6 +2680,107 @@ class LostStep(unittest.TestCase):
 
     def test_stop_never_acknowledged(self):
         self.run_mode("stop", stream=False)
+
+
+class EndTokenWriter(MockEngine):
+    """A model that WRITES the token that closes its own turn: once while it thinks about it, once quoted in its
+    answer.  Its scripts are the model's raw text - MockEngine's own append of the end token is left off, because
+    the last script ends with the boundary that really ends the reply.  Each call gets the next script, which is how
+    one request's passes continue from what the engine already holds."""
+
+    def __init__(self, tok, scripts):
+        super().__init__(tok, ["x"], max_context=CTX)
+        self.scripts = [tok.encode(s, parse_special=True) for s in scripts]
+        self.script, self.turns = self.scripts[0], 0
+        self.prompts: list[list[int]] = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class WritingAboutTheEndToken(unittest.TestCase):
+    """eos_lenient (opt-in "eos_lenient": true in strata-<model>.json): a stop token the model wrote ABOUT is text
+    about the boundary, not the boundary.  The reply continues from the token's name and its id (`<im_end: 257>`
+    here, `<im_end: 248046>` in the model's own tokenizer) and the client is shown the same text, so an answer sent
+    back on the next turn cannot become a boundary in the middle of a conversation."""
+
+    FROM = "The token that closes a turn here is "                      # then the model writes it, mid-thought
+    ON = " - it closes the turn, not the thinking."
+    ASK = "The answer is 4. Its closing token, quoted: " + chr(96)   # a code span: backtick, then the token
+    TO = "` in plain text."
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.end = self.tok.encode(IM_END, parse_special=True)[0]
+        self.escape = f"<im_end: {self.end}>"
+
+    def scripts(self):
+        return [self.FROM + IM_END,                       # the end token, written inside the thinking
+                self.ON + THINK_END + "\n\n" + self.ASK + IM_END,   # ... and quoted in the answer
+                self.TO + IM_END]                         # this one is the end of the turn
+
+    def ask(self, scripts, lenient, max_tokens=400):
+        engine = EndTokenWriter(self.tok, scripts)
+        svc = Service(engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.eos_lenient = lenient
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        body = {"model": "m", "max_tokens": max_tokens, "messages": [{"role": "user", "content": "2+2?"}]}
+        req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode()), engine.prompts, svc
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_a_thought_about_the_end_token_is_not_the_end(self):
+        b, prompts, svc = self.ask(self.scripts(), lenient=True)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], self.FROM + self.escape + self.ON)
+        self.assertEqual(msg["content"], self.ASK + self.escape + self.TO)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertEqual((svc.eos_escaped, svc.history[-1]["eos_escaped"]), (2, 2))
+
+    def test_the_engine_is_asked_to_continue_from_the_escape(self):
+        _, prompts, _ = self.ask(self.scripts(), lenient=True)
+        self.assertEqual(len(prompts), 3)
+        first, second = prompts[0], prompts[1]
+        self.assertEqual(second, first + self.tok.encode(self.FROM, parse_special=True)
+                         + self.tok.encode(self.escape, parse_special=False))
+        # the prompt has its own end tokens (one per ChatML turn); what matters is what was appended to it
+        self.assertNotIn(self.end, second[len(first):])       # the written token is dropped, not fed back
+        self.assertEqual(prompts[2][:len(second)], second)   # and the third pass continues from there
+
+    def test_without_it_the_thought_stops_where_the_token_is(self):
+        b, prompts, svc = self.ask(self.scripts(), lenient=False)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], self.FROM)
+        self.assertFalse(msg.get("content"))                   # no answer: the reply ended inside the thinking
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(svc.eos_escaped, 0)
+
+    def test_a_reply_that_keeps_writing_it_is_still_bounded(self):
+        from serve.server import EOS_LENIENT_MAX
+        scripts = [self.FROM + IM_END] * (EOS_LENIENT_MAX + 1)
+        b, prompts, svc = self.ask(scripts, lenient=True, max_tokens=1200)
+        msg = b["choices"][0]["message"]
+        self.assertEqual(msg["reasoning_content"], (self.FROM + self.escape) * EOS_LENIENT_MAX + self.FROM)
+        self.assertEqual(svc.eos_escaped, EOS_LENIENT_MAX)
+        self.assertEqual(b["choices"][0]["finish_reason"], "stop")
+
+    def test_the_escape_is_plain_text(self):
+        """What the model is asked to continue from must not hold a control token: an escape that wrote the boundary
+        again would end the very turn it means to save."""
+        svc = Service(MockEngine(self.tok, "x"), self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        names = {256 + k: s[2:-2] for k, s in enumerate(ByteTokenizer.SPECIALS)}
+        for t in sorted(svc.stop_ids):                      # the byte tokenizer's two end tokens
+            ids = svc.eos_escape(t)
+            self.assertEqual(svc.tok.decode(ids), f"<{names[t]}: {t}>")
+            self.assertFalse(any(x in svc.stop_ids for x in ids))   # the escape cannot write the boundary
 
 
 if __name__ == "__main__":

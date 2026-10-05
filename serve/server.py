@@ -387,6 +387,15 @@ def btrace(*a):
 
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
 
+# eos-lenience ("eos_lenient": true in strata-<model>.json, see Service.eos_lenient_reason).  A model that reasons
+# ABOUT its own end tokens writes them: mid-thought it uses the token that closes a turn to weigh what a boundary
+# is, and in an answer it quotes one between backticks.  Both are text, but the engine stops on the id, so the
+# thought dies in the middle and the model cannot think about the protocol it is asked to follow.  The way through
+# is to name the token instead of writing it: <im_end: 248046> - its name and its id as ordinary text, which no
+# merge turns into a control token.  The reply continues from there, the client is shown the same text, and a
+# client that sends the answer back next turn puts text in its prompt where a boundary would have been.
+EOS_LENIENT_MAX = 16          # escapes one reply may need before its next stop token is taken literally
+
 
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
@@ -1706,6 +1715,8 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.eos_lenient = False                          # a stop token the model wrote ABOUT is not a boundary
+        self.eos_escaped = 0                              # how many were escaped since this server started
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
@@ -1748,6 +1759,32 @@ class Service:
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"reasoning_budget_tokens={value!r}: expected a whole number of tokens (0: no budget)")
         return value if value > 0 else None
+
+    def eos_lenient_reason(self, token: int, parser, tail: str):
+        """Why this stop token is the model writing ABOUT the boundary rather than the boundary: a string, or None
+        when the turn really ends here.  Two shapes.  Inside a thinking block: a model that thinks about how a turn
+        ends uses the token that ends it, and stopping there loses the thought.  After a space and a backtick: it is
+        quoted in the answer.  Called with a token the server would stop on (Service.run's stop_ids), which is the
+        model's own end of turn and end of text - a stop string the client asked for would not come through here."""
+        if not self.eos_lenient:
+            return None
+        if parser.state == "reasoning":
+            return "written inside the thinking"
+        if tail.endswith(" `"):
+            return "quoted after a backtick"
+        return None
+
+    def eos_escape(self, token: int) -> list[int]:
+        """The ids of the escaped form of a stop token: its name and its id as ordinary text (`<im_end: 248046>`),
+        which is what the model continues from and what the client is shown, so the two stay the same text turn
+        after turn.  Checked on the way out: an escape that contains a stop token would end the turn it saves."""
+        name = self.tok.decode([token])
+        if name.startswith("<|") and name.endswith("|>"):
+            name = name[2:-2]
+        ids = self.tok.encode(f"<{name}: {token}>", parse_special=False)
+        if any(t in self.stop_ids for t in ids):
+            raise ValueError(f"the escape of token {token} is not plain text: {ids!r}")
+        return ids
 
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
@@ -2254,6 +2291,7 @@ class Service:
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        eos_escapes = 0                                 # stop tokens this reply wrote about
         emb = getattr(self.embeddings, "path", None)
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
@@ -2292,10 +2330,12 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    tail = ""                            # the text written so far: eos-lenience reads its end
                     while True:
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
-                        seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        seg, wrap, leaving = [], False, False   # this pass's tokens; why the pass ended; closed
+                        why, escaped = None, None        # eos-lenience: the stop token, and why it is not a boundary
                         try:
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
@@ -2307,8 +2347,17 @@ class Service:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
                                 if t in self.stop_ids:
-                                    finish = "stop"
-                                    raw_ids.append(t)
+                                    why = self.eos_lenient_reason(t, parser, tail)
+                                    if why is None:
+                                        finish = "stop"
+                                        raw_ids.append(t)
+                                        break
+                                    # The engine stopped on it, but the model wrote it as TEXT about the boundary.
+                                    # It is dropped rather than kept (the engine never committed it to the session
+                                    # either: it was the token that would have come next) and its escaped form takes
+                                    # its place, so the pass ends here and the next one continues from the escape.
+                                    n -= 1
+                                    wrap, escaped = "escape", t
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
@@ -2318,7 +2367,9 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
-                                evs = parser.feed(detok.push(t))
+                                delta = detok.push(t)
+                                tail = (tail + delta)[-24:]        # eos-lenience: is a stop token quoted here?
+                                evs = parser.feed(delta)
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
@@ -2327,7 +2378,7 @@ class Service:
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
                                     if thought >= budget and not parser.buf and not detok.pending():
-                                        wrap = True
+                                        wrap = "budget"
                                         break
                         except EngineDied as e:
                             finish = "error"
@@ -2355,17 +2406,35 @@ class Service:
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
-                        budget = None
-                        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+                        if wrap == "budget":
+                            budget = None
+                            extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+                            said = f"thinking budget reached ({thought} tokens): wrapping up the thinking"
+                        else:
+                            # eos-lenience.  The engine stopped on the id; the next request's prompt is this one
+                            # plus what it generated plus the escape, which is exactly what the session still holds
+                            # plus the escape, so only the escape is read again (RESUME says so).
+                            if eos_escapes >= EOS_LENIENT_MAX:
+                                print(f"[strata] eos-lenient: {EOS_LENIENT_MAX} stop tokens were written about in "
+                                      "one reply; the next one ends the turn (EOS_LENIENT_MAX in serve/server.py)",
+                                      flush=True)
+                                finish = "stop"
+                                break
+                            eos_escapes += 1
+                            self.eos_escaped += 1
+                            extra = self.eos_escape(escaped)
+                            said = (f"eos-lenient: {self.tok.decode([escaped])!r} {why}: not the end of the turn, "
+                                    f"the reply continues from {self.tok.decode(extra)!r}")
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
-                              flush=True)
+                        print(f"[strata] {said}", flush=True)
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state == "reasoning"
-                            evs = parser.feed(detok.push(t))
+                            delta = detok.push(t)
+                            tail = (tail + delta)[-24:]
+                            evs = parser.feed(delta)
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev
@@ -2414,7 +2483,8 @@ class Service:
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                "eos_escaped": eos_escapes or None})
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen
@@ -4059,6 +4129,14 @@ def main() -> int:
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    svc.eos_lenient = cfg.get("eos_lenient") is True     # a stop token the model wrote ABOUT does not end the turn
+    if svc.eos_lenient:
+        print("[strata] eos-lenient on: a stop token written inside the thinking, or right after a backtick, "
+              "is written back as its name and its id (like <im_end: 248046>) and the reply continues from "
+              "there; the client is shown the same text, so sending an answer back cannot turn it into a "
+              "boundary", flush=True)
+        for t in sorted(svc.stop_ids):
+            svc.eos_escape(t)                            # says so now, not in the middle of a reply
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
