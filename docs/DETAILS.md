@@ -656,6 +656,7 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | Text and ids, no chat template (llama.cpp's shape) | `POST /tokenize`, `POST /detokenize` |
 | The markers this vocabulary has as single tokens, and their ids | `GET /tokenizer` |
+| **Token soup: ids in, ids out** (llama.cpp's `/completion` shape) | `POST /completion` |
 | What the model is doing right now | `GET /status`, `GET /slots` (busy or idle, with `n_prompt_tokens`; one entry per slot with `--batch`) |
 | Save / restore the conversation to a file (session files, below) | `POST /slots/0?action=save\|restore` |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
@@ -700,6 +701,10 @@ for clients, not a guarantee that the model will follow a request. Zed's llama.c
 offer tools.
 
 `/tokenize` takes `{"content": "...", "parse_special": true, "add_special": false}` and answers `{"tokens": [...], "tokens_with_special": [...]}`; `/detokenize` takes `{"tokens": [...]}` and answers `{"content": "..."}`; `GET /tokenizer` lists the vocabulary's markers with their ids and their kind - `control` for the GGUF's type 3 (matched only with `parse_special`), `user_defined` for type 4 (matched always), the difference llama.cpp's own tokenizer makes and `strata_tokenizer` measures rather than assumes. These three read the tokenizer alone: no template, no roles, nothing wrapped around the text, and no model loaded. They are for clients whose protocol is token ids rather than messages - a turn protocol that writes a turn boundary as an id has to read that id off this model, and reading it is worth doing before the model is loaded anywhere.
+
+`POST /completion` is the same honesty about the generation itself. `prompt` is the request: a string, a list of ids, a list of strings, or the two mixed (which is how a client that already knows which parts of its prompt are markers says so). Sampling fields are the llama.cpp ones - `temperature`, `top_p`, `top_k`, `min_p`, `penalties`, `seed`, `n_predict` (`0`/`-1` means the room left in the context), `stream`, `return_tokens`. What comes back is `{"content": "...", "tokens": [...], "stop_type": "eos|limit", "tokens_evaluated", "tokens_predicted", "tokens_cached", "truncated"}`, or one SSE event per token with the same fields at the end, and a CONTROL token contributes no text to `content` because llama.cpp's decode contributes no text for one. Two things this route refuses to do: it does not stop on `stop` strings (it answers 400 and says why, because a client that asked for a stop string and got silence would believe its turn ended), and it does not hide the model's end-of-turn id - that id is emitted like any other token and `finish` says `eos`, so a client whose turn boundaries are ids ends its turn by reading one rather than by guessing from an absence. Where the chat path can tell that the model *wrote about* the boundary and escape it (`eos_lenient`), this route has no output parser to ask, so it ends at the id and says that is what happened.
+
+A client that stops reading is a decision, not an error: hanging up mid-stream stops the engine (STOP, drained to that request's own `DONE`) and the request is recorded as `disconnect`. That is how a protocol ends a turn mid-sentence without telling the server where the turn was.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{

@@ -3230,6 +3230,14 @@ class Service:
             return {i: (t, "control" if types[i] == 3 else "user_defined") for t, i in specials.items()}
         return {256 + k: (s, "control") for k, s in enumerate(getattr(self.tok, "SPECIALS", ()))}
 
+    def _control_ids(self) -> set:
+        """The ids this vocabulary spells as CONTROL markers (GGUF type 3).  llama.cpp's decode adds no text for
+        them, so a raw reply reads them as ids and nothing else - which is what a client that ends a turn by
+        reading an id needs the text channel to stay out of."""
+        if not hasattr(self, "_control_ids_"):
+            self._control_ids_ = {i for i, (_marker, kind) in self._markers().items() if kind == "control"}
+        return self._control_ids_
+
     def _bookends(self, add_special: bool) -> tuple:
         """The vocabulary's own bos and eos ids, from its GGUF metadata, for add_special.  Asking for special
         tokens a vocabulary does not declare is refused rather than answered with nothing."""
@@ -4167,6 +4175,176 @@ class Service:
         yield "done", done
 
 
+    def raw_prompt(self, req) -> list[int]:
+        """The prompt ids a raw request asks for: a string, a list of ids, a list of texts, or the two mixed -
+        llama.cpp's token-soup prompt.
+
+        Text is tokenized with markers read as markers, and ids are taken as given: a protocol that renders a
+        turn boundary renders it as an id.  An id that is not in this vocabulary is a typo, and the engine would
+        answer with whatever the model makes of a typo, so it is refused here instead."""
+        prompt = req.get("prompt")
+        if isinstance(prompt, str):
+            return self.tok.encode(prompt, parse_special=True)
+        if not isinstance(prompt, list) or not prompt:
+            raise ValueError("prompt: a string, a list of token ids, or a list of ids and text (token soup)")
+        ids, size = [], self._vocab_size()
+        for item in prompt:
+            if isinstance(item, int) and not isinstance(item, bool):
+                if item < 0 or (size is not None and item >= size):
+                    raise ValueError("prompt: %r is not an id in this vocabulary%s"
+                                     % (item, "" if size is None else f" (0..{size - 1})"))
+                ids.append(item)
+            elif isinstance(item, str):
+                ids += self.tok.encode(item, parse_special=True)
+            else:
+                raise ValueError(f"prompt: {item!r} is not a token id or a piece of text")
+        return ids
+
+    def complete_raw(self, ids, max_new, sampling, cancel):
+        """POST /completion: token soup in, token soup out.  No chat template, no roles, no output parser,
+        no thinking budget, no stop strings, no eos-lenience.
+
+        Yields ("token", id) for every id the engine produced - its end-of-turn id included, because for a
+        client whose turn boundaries are token ids that id is where its answer ended - then ("done", figures).
+
+        Two limits, and neither is this server's opinion about the answer: `max_new`, and the client.  A client
+        that stops reading gets the engine's STOP (Engine.generate's finally), which is how a protocol ends a
+        turn mid-sentence without the server being told where the turn was.
+
+        The engine still stops on its own end-of-turn ids.  On this route the server cannot tell whether the
+        model wrote one as text about the boundary - the chat path asks its output parser and can escape it
+        (eos_lenient) - so here the request simply ends there, and says so: finish "eos".
+        """
+        defaults = {**self.sampling_defaults, **self.shared}      # the config's, then the Chat settings shared with apps
+        if defaults:                     # the request's own fields win (an explicit 0 stays greedy)
+            req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
+            sampling = {**defaults, **req_values}
+        ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+        if ctx <= 0:
+            raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        room = ctx - CTX_SLACK - len(ids)
+        if room < 1:
+            raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context ({ctx}); "
+                             "requests are never truncated")
+        if max_new is None or max_new <= 0:
+            max_new = room                                  # n_predict 0 or -1: the rest of the context
+        elif max_new > room:
+            if not self.fit_max_tokens:
+                raise ValueError(f"prompt ({len(ids)} tokens) + n_predict ({max_new}) exceeds the context "
+                                 f"({ctx}); requests are never truncated. Send a smaller n_predict (at most "
+                                 f"{room} here), or add \"fit_max_tokens\": true to the model's strata-<model>.json "
+                                 "to shorten it to the room left (#545)")
+            max_new = room
+
+        n, finish = 0, "length"
+        run_tok, run_len, repeated = None, 0, False
+        last, timings, before = {}, None, getattr(self.engine, "last", None)
+        with self.status_lock:
+            self.status["queued"] += 1
+        with self.fifo:
+            try:
+                with self.status_lock:
+                    self.status["queued"] -= 1
+                    self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
+                                       generated=0, started=time.time(), first_token=None, tool=None,
+                                       tail="", max_tokens=max_new)
+                self.last_request_at = time.time()
+                self.rate.clear()
+                self.ensure_loaded()
+                last_print = time.time()
+                gen = self.engine.generate(ids, max_new, sampling or {}, cancel)
+                try:
+                    for t in gen:
+                        if t is None:                       # the engine's heartbeat while it reads the prompt
+                            last_print = self._progress(last_print)
+                            yield "ping", None
+                            continue
+                        n += 1
+                        self._note(n, [])
+                        last_print = self._progress(last_print)
+                        run_len = run_len + 1 if t == run_tok else 1
+                        run_tok = t
+                        if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
+                            repeated, finish = True, "length"   # #606: a degenerate output, not an answer
+                            break
+                        yield "token", int(t)             # the id goes out before anyone decides about it
+                        if t in self.stop_ids:
+                            finish = "eos"
+                            break
+                        if n >= max_new:
+                            finish = "length"
+                            break
+                finally:
+                    gen.close()          # STOP + drain to THIS request's DONE while the fifo is still held
+                if cancel.is_set():
+                    finish = "cancel"
+            except GeneratorExit:               # the client hung up mid-stream: the close above stopped the engine
+                finish = "disconnect"
+                raise
+            finally:
+                with self.status_lock:      # settle while the fifo is held, as run() does: the next request
+                    if self.status.get("busy"):     # must not find this one's figures
+                        last = dict(getattr(self.engine, "last", {}) or {}) \
+                            if getattr(self.engine, "last", None) is not before else {}
+                        started = self.status.get("started", time.time())
+                        seen = prompt_tokens_seen(len(ids), last)
+                        timings = request_timings(seen, n, last)
+                        hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                        # #588: the share the GPU read over PCIe or another GPU computed (None: an older engine)
+                        routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
+                        pcie_share = round(last["offloaded"] / routed, 3) \
+                            if last.get("offloaded") is not None and routed else None
+                        self.history.append({
+                            "projection": None, "time": started, "duration_s": round(time.time() - started, 1),
+                            "finish": finish, "prompt_tokens": seen, "reused": last.get("reused"),
+                            "output_tokens": n, "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                            "reasoning_recoveries": 0, "reasoning_repeat_coverage": 0.0,
+                            "engine_generated": last.get("generated"), "prompt_ms": last.get("prompt_ms"),
+                            "decode_ms": last.get("decode_ms"),
+                            "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
+                            if n and last.get("generated") and last.get("decode_ms") else None,
+                            "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
+                            "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
+                            "drafts_offered": last.get("drafts_offered"),
+                            "drafts_accepted": last.get("drafts_accepted"), "eos_escaped": None})
+                        tot = self.totals
+                        tot["requests"] += 1
+                        tot["prompt_tokens"] += seen
+                        tot["reused"] += last.get("reused") or 0
+                        tot["output_tokens"] += n
+                        tot["prompt_ms"] += last.get("prompt_ms") or 0.0
+                        tot["decode_ms"] += last.get("decode_ms") or 0.0
+                        tot["drafts_offered"] += last.get("drafts_offered") or 0
+                        tot["drafts_accepted"] += last.get("drafts_accepted") or 0
+                        ft0 = self.status.get("first_token")       # this request's own, as in run()
+                        self.latencies.observe(ft0 - started if ft0 else None, n,
+                                               (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
+                        fresh = getattr(self.engine, "last", None)
+                        if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                            self.last_timings = dict(timings, at=int(time.time())) if timings else None
+                        self.last_request_at = time.time()
+                        now = time.time()
+                        el = now - self.status.get("started", now)
+                        ft = self.status.get("first_token")
+                        rate = n / max(1e-6, now - ft) if ft else 0.0
+                        hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
+                        if hit_msg and pcie_share:
+                            hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
+                        print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
+                              f"(raw {finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                        if repeated:
+                            print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
+                                  f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens)",
+                                  flush=True)
+                    self.status["busy"] = False
+                    self.status.pop("tail", None)
+                    self.status.pop("tool", None)
+
+        yield "done", {"finish": finish, "generated": n, "prompt_tokens": len(ids),
+                       "reused": (timings or {}).get("cache_n", 0), "timings": timings,
+                       "prompt_read": last.get("prompt_read")}
+
+
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
     """#471: the prompt tokens a request got through - all of them, unless the engine's DONE line says a cancel stopped
     its prompt read part-way (then the reused ones plus those read).  /metrics' history and totals count these, so a
@@ -5092,10 +5270,12 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/completion"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
+                elif path == "/completion":
+                    self._completion(req)
                 elif path.startswith("/slots/"):
                     query = parse_qs(self.path.partition("?")[2])
                     try:
@@ -5360,6 +5540,90 @@ def make_handler(svc: Service):
                     yield item
             finally:
                 items.close()
+
+        def _completion(self, req):
+            """POST /completion: llama.cpp's raw endpoint.  Token soup in, token soup out.
+
+            `prompt`: a string, a list of token ids, or ids and text mixed.  `n_predict`: at most how many
+            tokens to produce (0 or -1: the room left in the context).  `stream`: one event per token with its
+            id - the model's end-of-turn id included, since for a client whose boundaries are ids that id is
+            where its answer ended - then a last event with the figures and no token.
+
+            What this route keeps out of the way is this server's own opinion about the answer: no chat
+            template, no roles, no output parser, no thinking budget - and no `stop` strings, which is the one
+            llama.cpp field it does not honour: a client that wants a boundary of its own reads the ids, and
+            ends the generation by stopping reading (the engine gets its STOP).
+            """
+            ids = svc.raw_prompt(req)
+            max_new = req.get("n_predict", req.get("max_tokens"))
+            if max_new is not None and (isinstance(max_new, bool) or not isinstance(max_new, int)):
+                raise ValueError("n_predict: a whole number of tokens (0 or -1: the room left in the context)")
+            if req.get("stop"):
+                raise ValueError("stop: this endpoint does not stop on text; it produces at most n_predict "
+                                 "tokens, or until the model's own end-of-turn token. A client that wants its "
+                                 "own boundary reads the ids, which this endpoint streams one at a time")
+            svc.load()
+            name, control = svc.model_for(req), svc._control_ids()
+            cancel = threading.Event()
+            self._watch_client(cancel)        # #430 #431: a client that hung up stops the engine
+
+            def stop_type(finish):
+                return {"eos": "eos", "length": "limit", "cancel": "cancel", "disconnect": "stop"}.get(finish,
+                                                                                                         finish)
+
+            def figures_of(done):
+                return {"tokens_evaluated": done.get("prompt_tokens", 0), "tokens_predicted": done.get("generated", 0),
+                        "tokens_cached": done.get("reused") or 0, "stop_type": stop_type(done.get("finish")),
+                        "truncated": done.get("finish") == "length",
+                        **({"timings": done["timings"]} if done.get("timings") else {})}
+
+            if not req.get("stream"):
+                out, detok, done = [], Detokenizer(svc.tok), None
+                for kind, x in svc.complete_raw(ids, max_new, req, cancel):
+                    if kind == "token":
+                        out.append(x)
+                        if x not in control:                 # llama.cpp's decode: a CONTROL token adds no text
+                            detok.push(x)
+                    elif kind == "done":
+                        done = x
+                done = done or {}
+                body = {"content": svc.tok.decode([t for t in out if t not in control]), "model": name,
+                        **figures_of(done)}
+                if req.get("return_tokens", True) is not False:
+                    body["tokens"] = out
+                self._json(200, body)
+                return
+
+            self._sse()
+            detok, done = Detokenizer(svc.tok), {}
+            try:
+                for kind, x in svc.complete_raw(ids, max_new, req, cancel):
+                    if kind == "ping":
+                        self.wfile.write(b": keep-alive\n\n")     # an SSE comment: clients ignore it
+                    elif kind == "token":
+                        piece = "" if x in control else detok.push(x)
+                        ev = {"content": piece, "token": svc.tok.decode([x]), "tokens": [x], "model": name,
+                              "stop": False}
+                        self.wfile.write(b"data: " + json.dumps(ev, ensure_ascii=False).encode() + b"\n\n")
+                    else:
+                        done = x
+                        self.wfile.write(b"data: " + json.dumps({"content": "", "tokens": [], "model": name,
+                                                                 "stop": True, **figures_of(x)},
+                                                                ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()                                 # the client went away: stop the engine
+            except EngineDied as e:                          # mid-stream: say so, then end the stream properly
+                err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except ValueError as e:                          # the engine's ERR after the stream started
+                err = {"error": {"type": "server_error", "message": str(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
