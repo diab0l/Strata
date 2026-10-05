@@ -760,6 +760,18 @@ print(r.choices[0].message.content)
   `"recover"` needs the exact xhigh sentence in the first system message and skips requests with images; re-reading
   the changed prefix costs prompt time. Either mode can mistake repeated useful code or checks for a loop, so keep
   the recorded answer quality alongside the completion rate when testing it.
+- **A stop token the model writes ABOUT does not end the reply (opt-in).** A model that reasons about how its turns
+  end uses the tokens that end them: it writes one mid-thought to weigh what a boundary is, or quotes one between
+  backticks in its answer. The engine stops on the id, so the thought dies in the middle and the model cannot think
+  about the protocol it is being asked to follow. `"eos_lenient": true` in `strata-<model>.json` names the token
+  instead of keeping it - the reply continues from `<im_end: 248046>`, its name and its id as plain text, which no
+  merge turns into a control token. It is what the client is shown as well as what the model continues from, so an
+  answer sent back on the next turn carries text where a boundary would have been, and it nudges the model to write
+  the name next time. Only two shapes are lenient: inside a thinking block, and right after a space and a backtick.
+  Elsewhere the end-of-turn token ends the turn, and a thinking budget, `max_tokens` or the repeated-token rule
+  still end a reply as before. Each escape reads again only itself: the next pass's prompt is what the session already holds
+  plus the escape (`RESUME` says so), the same restart the thinking budget uses. At most 16 per reply, then the next
+  one ends it. Off by default.
 - **Changing the effort without re-reading the prompt (opt-in, 0.1.39, #458).** The effort's instruction is the
   first thing in the prompt, so a request that only changes the effort (an agent's "think harder" switch, `none` for
   a quick tool step) reads the whole conversation again. `"effort_position": "end"` in `strata-<model>.json` renders
