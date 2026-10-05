@@ -3212,6 +3212,80 @@ class Service:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
+    def _vocab_size(self) -> int | None:
+        """How many ids this vocabulary has, or None when it is the byte stand-in (which has no list)."""
+        tokens = getattr(self.tok, "tokens", None)
+        return len(tokens) if tokens is not None else None
+
+    def _markers(self) -> dict:
+        """The markers this vocabulary holds as single tokens: id -> (spelling, kind).
+
+        GGUF token types are kept apart because llama.cpp treats them differently and strata_tokenizer measured
+        it rather than assumed it: type 3 (CONTROL: the turn markers, end-of-text) is matched only when
+        parse_special is set, type 4 (USER_DEFINED: think tags, tool blocks) is matched always.  A protocol that
+        renders a turn boundary needs the first kind and must not confuse it with the second."""
+        specials = getattr(self.tok, "special_tokens", None)
+        if specials:
+            types = getattr(self.tok, "token_types", None) or []
+            return {i: (t, "control" if types[i] == 3 else "user_defined") for t, i in specials.items()}
+        return {256 + k: (s, "control") for k, s in enumerate(getattr(self.tok, "SPECIALS", ()))}
+
+    def _bookends(self, add_special: bool) -> tuple:
+        """The vocabulary's own bos and eos ids, from its GGUF metadata, for add_special.  Asking for special
+        tokens a vocabulary does not declare is refused rather than answered with nothing."""
+        gguf = getattr(self.tok, "special_ids", None) or {}
+        bos, eos = gguf.get("tokenizer.ggml.bos_token_id"), gguf.get("tokenizer.ggml.eos_token_id")
+        if add_special and bos is None and eos is None:
+            raise ValueError("add_special: this vocabulary declares no bos or eos token to add")
+        return bos, eos
+
+    def tokenizer_info(self) -> dict:
+        """GET /tokenizer: what the vocabulary knows, with no model loaded and no GPU touched - a tokenizer is a
+        file.  For the clients that speak ids: a protocol whose turn boundaries are token ids has to read this
+        model's ids off this model, and a family's ids are knowable before the family runs anywhere."""
+        out = {"model": self.model, "pre": getattr(self.tok, "pre", None),
+               "markers": [{"id": i, "marker": t, "kind": k} for i, (t, k) in sorted(self._markers().items())]}
+        if (size := self._vocab_size()) is not None:
+            out["vocab"] = size
+        gguf = getattr(self.tok, "special_ids", None) or {}
+        if ids := {k[len("tokenizer.ggml."):]: v for k, v in gguf.items() if k.startswith("tokenizer.ggml.")}:
+            out["ids"] = ids
+        return out
+
+    def tokenize(self, req) -> dict:
+        """POST /tokenize, as llama.cpp's: text in, ids out - no chat template, no roles, nothing wrapped around
+        it.  `tokens` is the plain encoding, `tokens_with_special` the one with add_special applied.  parse_special
+        follows llama.cpp: CONTROL markers become markers only with it, USER_DEFINED markers always."""
+        text = req.get("content")
+        if not isinstance(text, str):
+            raise ValueError("content: the text to tokenize")
+        for key in ("parse_special", "add_special"):
+            if req.get(key) is not None and not isinstance(req[key], bool):
+                raise ValueError(f"{key}: true or false")
+        ids = self.tok.encode(text, parse_special=req.get("parse_special", True))
+        bos, eos = self._bookends(req.get("add_special") is True)
+        return {"tokens": ids,
+                "tokens_with_special": ids if bos is None and eos is None else [x for x in (bos, *ids, eos)
+                                                                               if x is not None]}
+
+    def detokenize(self, req) -> dict:
+        """POST /detokenize, as llama.cpp's: ids in, text out - the way to read a control id's spelling off a
+        vocabulary instead of assuming it.  An id outside the vocabulary is a 400, as there."""
+        ids = req.get("tokens")
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("tokens: the ids to read back as text")
+        if req.get("add_special") is not None and not isinstance(req["add_special"], bool):
+            raise ValueError("add_special: true or false")
+        size = self._vocab_size()
+        for t in ids:
+            if isinstance(t, bool) or not isinstance(t, int) or t < 0 or (size is not None and t >= size):
+                raise ValueError("tokens: %r is not an id in this vocabulary%s"
+                                 % (t, "" if size is None else f" (0..{size - 1})"))
+        if req.get("add_special") is True:
+            bos, eos = self._bookends(True)
+            ids = [x for x in (bos, *ids, eos) if x is not None]
+        return {"content": self.tok.decode(ids)}
+
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
         if not self.api_monitor:
@@ -4928,6 +5002,9 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
+            elif path == "/tokenizer":
+                if self._authorized():
+                    self._json(200, svc.tokenizer_info())
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -5034,6 +5111,10 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path == "/tokenize":
+                    self._json(200, svc.tokenize(req))
+                elif path == "/detokenize":
+                    self._json(200, svc.detokenize(req))
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:

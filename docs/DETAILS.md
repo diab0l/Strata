@@ -654,6 +654,8 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
+| Text and ids, no chat template (llama.cpp's shape) | `POST /tokenize`, `POST /detokenize` |
+| The markers this vocabulary has as single tokens, and their ids | `GET /tokenizer` |
 | What the model is doing right now | `GET /status`, `GET /slots` (busy or idle, with `n_prompt_tokens`; one entry per slot with `--batch`) |
 | Save / restore the conversation to a file (session files, below) | `POST /slots/0?action=save\|restore` |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
@@ -696,6 +698,8 @@ leading system message. `supports_preserve_reasoning` means older assistant turn
 in the rendered prompt. It does not describe whether a new reply returns reasoning. These are compatibility hints
 for clients, not a guarantee that the model will follow a request. Zed's llama.cpp provider reads this object to
 offer tools.
+
+`/tokenize` takes `{"content": "...", "parse_special": true, "add_special": false}` and answers `{"tokens": [...], "tokens_with_special": [...]}`; `/detokenize` takes `{"tokens": [...]}` and answers `{"content": "..."}`; `GET /tokenizer` lists the vocabulary's markers with their ids and their kind - `control` for the GGUF's type 3 (matched only with `parse_special`), `user_defined` for type 4 (matched always), the difference llama.cpp's own tokenizer makes and `strata_tokenizer` measures rather than assumes. These three read the tokenizer alone: no template, no roles, nothing wrapped around the text, and no model loaded. They are for clients whose protocol is token ids rather than messages - a turn protocol that writes a turn boundary as an id has to read that id off this model, and reading it is worth doing before the model is loaded anywhere.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
